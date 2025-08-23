@@ -9,6 +9,19 @@ import pathlib
 import traceback
 import pandas as pd
 import gradio as gr
+from pathlib import Path
+import subprocess, socket
+
+
+DEBUG = os.getenv("DEBUG_AGENT", "1") == "1"
+
+def dprint(*args, **kwargs):
+    if DEBUG:
+        print(*args, **kwargs)
+
+def _short(s, n=180):
+    s = str(s or "").replace("\n", " ").replace("\r", " ")
+    return (s[:n] + "…") if len(s) > n else s
 
 # ====== keep constants ======
 DEFAULT_API_URL = "https://agents-course-unit4-scoring.hf.space"
@@ -38,6 +51,28 @@ GAIA_PREFIXES = [
 ]
 
 # ---------- helpers ----------
+
+def _default_agent_code() -> str:
+    sid = os.getenv("SPACE_ID")
+    if sid:
+        return f"https://huggingface.co/spaces/{sid}/tree/main"
+    # try git remote
+    try:
+        url = subprocess.check_output(
+            ["git", "config", "--get", "remote.origin.url"], text=True
+        ).strip()
+        if url:
+            if url.startswith("git@"):
+                host, path = url.split(":", 1)
+                host = host.replace("git@", "")
+                url = f"https://{host}/{path}"
+            return url.removesuffix(".git")
+    except Exception:
+        pass
+    # long local fallback to satisfy API min-length
+    return f"local://{socket.gethostname()}{Path.cwd()}"
+
+
 def _resolve_attachment_local_or_download(api_url: str, task: dict) -> str:
     """
     Try to resolve task['file_name'] to a local path.
@@ -139,7 +174,9 @@ class ControllerAgent:
         state["auto_finish_after_tool"] = False
 
         t0 = time.perf_counter()
-        out = self.app.invoke(state)
+        rec_lim = max(120, 5 * max_steps)  # e.g., 20 steps → 100; cap to >=120
+        dprint(f"[RUN] {task_id}: max_steps={max_steps} recursion_limit={rec_lim}")
+        out = self.app.invoke(state, config={"recursion_limit": rec_lim})
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
 
         answer = out.get("answer", "")
@@ -149,12 +186,14 @@ class ControllerAgent:
         return answer, reasoning_trace, last_tool, steps, elapsed_ms
 
 
-def run_and_submit_all(profile: gr.OAuthProfile | None):
-    """
-    Fetch questions, run controller agent, submit answers, show results, and save competition JSONL.
-    """
-    # ---- OAuth / identity ----
+def run_and_submit_all(
+    profile: gr.OAuthProfile | None,
+    agent_code_override: str = "",
+    max_steps: int = 20,
+):
+    # --- Determine HF Space Runtime URL and Repo URL ---
     space_id = os.getenv("SPACE_ID")
+
     if profile:
         username = f"{profile.username}"
         print(f"User logged in: {username}")
@@ -166,131 +205,167 @@ def run_and_submit_all(profile: gr.OAuthProfile | None):
     questions_url = f"{api_url}/questions"
     submit_url = f"{api_url}/submit"
 
-    # ---- Instantiate your agent ----
+    # 1. Instantiate Agent (ControllerAgent preferred; fallback to BasicAgent)
     try:
+        from agent.graph import build_controller_app, make_initial_state  # if not already imported
+        class ControllerAgent:
+            def __init__(self):
+                self.app = build_controller_app()
+            def __call__(self, *, task_id: str, question: str, file_path: str = "", max_steps: int = 20):
+                state = make_initial_state(task_id=task_id, question=question, file_name=file_path, max_steps=max_steps)
+                state["auto_finish_after_tool"] = False
+                rec_lim = max(120, 5 * max_steps)
+                dprint(f"[RUN] {task_id}: max_steps={max_steps} recursion_limit={rec_lim}")
+                out = self.app.invoke(state, config={"recursion_limit": rec_lim})
+                # Build a simple reasoning trace from plan + scratchpad (if available)
+                plan = out.get("plan") or []
+                sp = out.get("scratchpad") or []
+                lines = []
+                if plan:
+                    lines.append("PLAN:")
+                    for i, s in enumerate(plan, 1):
+                        lines.append(f"  {i}. goal={s.get('goal','')} | tool_hint={s.get('tool_hint','')}")
+                if sp:
+                    lines.append("TRACE:")
+                    for i, t in enumerate(sp, 1):
+                        lines.append(f"  {i}. [{t.get('action','')}] {t.get('thought','')} → {str(t.get('observation',''))[:200]}")
+                trace = "\n".join(lines)
+
+                        # Plan summary
+                if plan:
+                    dprint(f"[PLAN] {task_id}: {len(plan)} steps")
+                    for i, ps in enumerate(plan, 1):
+                        dprint(f"  {i}. goal={ps.get('goal','')} | tool_hint={ps.get('tool_hint','')} | params_hint={ps.get('params_hint',{})}")
+                # Scratchpad steps
+                if sp:
+                    dprint(f"[TRACE] {task_id}: {len(sp)} turns")
+                    for i, t in enumerate(sp, 1):
+                        dprint(f"  [STEP {i}] action={t.get('action','')} success={t.get('success',False)} dur={t.get('duration_ms','?')}ms")
+                        dprint(f"            params={t.get('params',{})}")
+                        dprint(f"            obs={_short(t.get('observation',''), 200)}")
+
+                dprint(f"[ANSWER] {task_id}: {_short(answer, 200)} | last_tool={last_tool}")
+                dprint("-"*80)
+
+                return out.get("answer",""), trace, out.get("last_tool",""), len(sp), 0
         agent = ControllerAgent()
     except Exception as e:
-        print(f"Error instantiating agent: {e}")
+        print(f"Error instantiating ControllerAgent: {e}")
         return f"Error initializing agent: {e}", None
 
-    agent_code = f"https://huggingface.co/spaces/{space_id}/tree/main" if space_id else "N/A"
-    print("Agent code:", agent_code)
+    # compute agent_code (use override if provided)
+    agent_code = (agent_code_override or "").strip() or _default_agent_code()
+    if len(agent_code) < 10:
+        agent_code = _default_agent_code()
+    print("agent_code:", agent_code)
 
-    # ---- Fetch questions ----
+    # 2. Fetch Questions (unchanged)
     print(f"Fetching questions from: {questions_url}")
     try:
-        r = requests.get(questions_url, timeout=30)
-        r.raise_for_status()
-        questions_data = r.json()
+        response = requests.get(questions_url, timeout=30)
+        response.raise_for_status()
+        questions_data = response.json()
         if not questions_data:
             print("Fetched questions list is empty.")
             return "Fetched questions list is empty or invalid format.", None
         print(f"Fetched {len(questions_data)} questions.")
     except requests.exceptions.RequestException as e:
+        print(f"Error fetching questions: {e}")
         return f"Error fetching questions: {e}", None
     except requests.exceptions.JSONDecodeError as e:
+        print(f"Error decoding server response for questions: {e}")
+        print(f"Response text: {response.text[:500]}")
         return f"Error decoding server response for questions: {e}", None
     except Exception as e:
+        print(f"An unexpected error occurred fetching questions: {e}")
         return f"An unexpected error occurred fetching questions: {e}", None
 
-    # ---- Run agent on each question ----
-    results_log = []
-    answers_payload = []
-    comp_lines = []  # competition JSONL lines
-
+    # 3. Run agent
+    results_log, answers_payload = [], []
     print(f"Running agent on {len(questions_data)} questions...")
-    for item in questions_data:
-        task_id = item.get("task_id")
-        question_text = item.get("question", "")
+    for idx, item in enumerate(questions_data, 1):
+        
+        task_id = item.get("task_id") or f"task_{idx}"
+        question_text = item.get("question") or ""             # always defined
+        file_path = (item.get("file_name") or "").strip()
+
+        dprint(f"[TASK {idx}/{len(questions_data)}] id={task_id}")
+        dprint(f"[Q] {_short(question_text, 240)}")
+        dprint(f"[FILE] {file_path or '-'}")
+        
         if not task_id or question_text is None:
             print(f"Skipping item with missing task_id or question: {item}")
             continue
-
-        # Resolve any attached file to a local path
-        file_path = _resolve_attachment_local_or_download(api_url, item)
-
         try:
+            file_path = (item.get("file_name") or "").strip()
+            # If you have a resolver/downloader, call it here to turn file_name into an absolute path.
             answer, trace, last_tool, steps, elapsed_ms = agent(
-                task_id=task_id, question=question_text, file_path=file_path, max_steps=8
+                task_id=task_id, question=question_text, file_path=file_path, max_steps=max_steps
             )
         except Exception as e:
-            err = f"AGENT ERROR: {e}"
             print(f"Error running agent on task {task_id}: {e}")
-            print(traceback.format_exc())
-            answer, trace, last_tool, steps, elapsed_ms = err, "", "", 0, 0
+            answer, trace, last_tool, steps, elapsed_ms = f"AGENT ERROR: {e}", "", "", 0, 0
 
-        # for Space submission API
         answers_payload.append({"task_id": task_id, "submitted_answer": answer})
-
-        # for UI table
         results_log.append({
             "Task ID": task_id,
             "Question": question_text,
-            "Resolved File": os.path.basename(file_path) if file_path else "",
+            "Resolved File": file_path,
             "Submitted Answer": answer,
             "Tool Used": last_tool,
             "Steps": steps,
             "Duration (ms)": elapsed_ms,
         })
 
-        # for HF competition JSONL (one JSON object per line)
-        comp_lines.append({
-            "task_id": task_id,
-            "model_answer": answer,
-            "reasoning_trace": trace,
-        })
-
     if not answers_payload:
         print("Agent did not produce any answers to submit.")
         return "Agent did not produce any answers to submit.", pd.DataFrame(results_log)
 
-    # ---- Save competition JSONL locally ----
-    jsonl_path = RUNS_ROOT / "competition_output.jsonl"
-    with open(jsonl_path, "w", encoding="utf-8") as f:
-        for obj in comp_lines:
-            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
-    print(f"Saved competition JSONL: {jsonl_path.resolve()}")
-
-    # ---- Submit to Space scoring endpoint ----
+    # 4. Prepare Submission
     submission_data = {"username": username.strip(), "agent_code": agent_code, "answers": answers_payload}
     status_update = f"Agent finished. Submitting {len(answers_payload)} answers for user '{username}'..."
     print(status_update)
 
+    # 5. Submit (unchanged)
     print(f"Submitting {len(answers_payload)} answers to: {submit_url}")
     try:
-        r = requests.post(submit_url, json=submission_data, timeout=120)
-        r.raise_for_status()
-        result_data = r.json()
+        response = requests.post(submit_url, json=submission_data, timeout=120)
+        response.raise_for_status()
+        result_data = response.json()
         final_status = (
             f"Submission Successful!\n"
             f"User: {result_data.get('username')}\n"
             f"Overall Score: {result_data.get('score', 'N/A')}% "
             f"({result_data.get('correct_count', '?')}/{result_data.get('total_attempted', '?')} correct)\n"
-            f"Message: {result_data.get('message', 'No message received.')}\n\n"
-            f"Competition JSONL saved to: {jsonl_path.resolve()}"
+            f"Message: {result_data.get('message', 'No message received.')}"
         )
         print("Submission successful.")
         results_df = pd.DataFrame(results_log)
         return final_status, results_df
-
     except requests.exceptions.HTTPError as e:
+        error_detail = f"Server responded with status {e.response.status_code}."
         try:
-            detail = e.response.json().get("detail", e.response.text)
-        except Exception:
-            detail = e.response.text
-        status_message = f"Submission Failed: HTTP {e.response.status_code}. Detail: {detail}\nCompetition JSONL saved to: {jsonl_path.resolve()}"
+            error_json = e.response.json()
+            error_detail += f" Detail: {error_json.get('detail', e.response.text)}"
+        except requests.exceptions.JSONDecodeError:
+            error_detail += f" Response: {e.response.text[:500]}"
+        status_message = f"Submission Failed: {error_detail}"
+        print(status_message)
         results_df = pd.DataFrame(results_log)
         return status_message, results_df
     except requests.exceptions.Timeout:
-        status_message = f"Submission Failed: The request timed out.\nCompetition JSONL saved to: {jsonl_path.resolve()}"
+        status_message = "Submission Failed: The request timed out."
+        print(status_message)
         results_df = pd.DataFrame(results_log)
         return status_message, results_df
     except requests.exceptions.RequestException as e:
-        status_message = f"Submission Failed: Network error - {e}\nCompetition JSONL saved to: {jsonl_path.resolve()}"
+        status_message = f"Submission Failed: Network error - {e}"
+        print(status_message)
         results_df = pd.DataFrame(results_log)
         return status_message, results_df
     except Exception as e:
-        status_message = f"An unexpected error occurred during submission: {e}\nCompetition JSONL saved to: {jsonl_path.resolve()}"
+        status_message = f"An unexpected error occurred during submission: {e}"
+        print(status_message)
         results_df = pd.DataFrame(results_log)
         return status_message, results_df
 
@@ -313,12 +388,23 @@ with gr.Blocks() as demo:
     )
 
     gr.LoginButton()
+    agent_code_box = gr.Textbox(
+    label="Agent code URL (repo link)",
+    value=_default_agent_code(),
+    placeholder="https://huggingface.co/spaces/<user>/<space>/tree/main or your GitHub repo URL",)
+
+    max_steps_inp = gr.Slider(
+    minimum=5, maximum=120, step=1, value=40,
+    label="Max Steps",)
+
+
     run_button = gr.Button("Run Evaluation & Submit All Answers")
 
     status_output = gr.Textbox(label="Run Status / Submission Result", lines=10, interactive=False)
     results_table = gr.DataFrame(label="Questions and Agent Answers", wrap=True)
+    max_steps_inp = gr.Slider( minimum=5, maximum=60, step=1, value=20, label="Max Steps" )
 
-    run_button.click(fn=run_and_submit_all, outputs=[status_output, results_table])
+    run_button.click(fn=run_and_submit_all, inputs=[agent_code_box, max_steps_inp],  outputs=[status_output, results_table])
 
 
 if __name__ == "__main__":

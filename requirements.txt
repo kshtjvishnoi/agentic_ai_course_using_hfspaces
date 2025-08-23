@@ -1,0 +1,7 @@
+gradio==4.44.1
+requests
+pandas
+langgraph
+llama-index
+llama-index-llms-openai
+openai>=1.42.0
