@@ -17,15 +17,8 @@ import argparse
 import json
 import traceback
 
-# --- Import your modules (adjust if your package name/path differs) ---
-try:
-    # Preferred: project structure like: agent/controller.py, agent/registry.py
-    from agent.controller import controller_node
-    from agent.registry import TOOL_REGISTRY, tool_allowed
-except Exception:
-    # Fallback: controller.py and registry.py in the same directory as this file
-    from controller import controller_node
-    from registry import TOOL_REGISTRY, tool_allowed
+from agent.controller import controller_node
+from agent.registry import TOOL_REGISTRY, tool_allowed
 
 
 def run_tool(tool_name: str, params: dict, state: dict) -> dict:

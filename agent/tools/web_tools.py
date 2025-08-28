@@ -1,163 +1,213 @@
 from __future__ import annotations
-import re, html
-from typing import Optional, List
+import re, html, os, json
+from typing import Optional, List, Dict, Tuple
 from ..registry import tool
 from ..state import State
 from ..config import OPENAI_API_KEY, OPENAI_MODEL
 from openai import OpenAI
-
-# --- Search client import (ddgs -> fallback to duckduckgo_search) ---
-_HAS_DDGS = False
-DDGS = None
-try:
-    # New package name (recommended): pip install ddgs
-    from ddgs import DDGS  # type: ignore
-    _HAS_DDGS = True
-except Exception:
-    try:
-        # Legacy package name (deprecated): pip install duckduckgo-search
-        from duckduckgo_search import DDGS  # type: ignore
-        _HAS_DDGS = True
-    except Exception:
-        DDGS = None
-        _HAS_DDGS = False
-
-# --- Optional HTML parsing ---
-try:
-    from bs4 import BeautifulSoup  # pip install beautifulsoup4
-except Exception:
-    BeautifulSoup = None
+from langchain_community.tools import WikipediaQueryRun
+from langchain_community.utilities.wikipedia import WikipediaAPIWrapper
+from langchain_community.agent_toolkits.load_tools import load_tools
+from langchain_community.utilities import GoogleSerperAPIWrapper
+#from langchain_openai import OpenAI
+from langchain.agents import initialize_agent, Tool
+from langchain.agents import AgentType
+from langchain_community.utilities import SerpAPIWrapper
 
 
-# ----- helpers -----
+"""Util that calls Wikipedia."""
 
-def _openai_client():
-    return OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+import logging
+from typing import Any, Dict, Iterator, List, Optional
 
-def _first_n_chars(s: str, n: int = 6000) -> str:
-    s = re.sub(r"\s+", " ", s).strip()
-    return s[:n]
+from langchain_core.documents import Document
+from pydantic import BaseModel, model_validator
 
-def _fetch_url_text(url: str, timeout: int = 12) -> str:
-    """Fetch and extract readable text from a web page."""
-    import requests
-    if BeautifulSoup is None:
-        return ""
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (AgenticGraph/1.0; +https://example.local)"
-        }
-        r = requests.get(url, timeout=timeout, headers=headers)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        for bad in soup(["script", "style", "noscript"]):
-            bad.decompose()
-        text = " ".join(
-            el.get_text(" ", strip=True)
-            for el in soup.find_all(["p", "li", "h2", "h3"])
+logger = logging.getLogger(__name__)
+
+WIKIPEDIA_MAX_QUERY_LENGTH = 300
+
+
+
+
+class WikipediaAPIWrapper(BaseModel):
+    """Wrapper around WikipediaAPI.
+
+    To use, you should have the ``wikipedia`` python package installed.
+    This wrapper will use the Wikipedia API to conduct searches and
+    fetch page summaries. By default, it will return the page summaries
+    of the top-k results.
+    It limits the Document content by doc_content_chars_max.
+    """
+
+    wiki_client: Any  #: :meta private:
+    top_k_results: int = 1
+    lang: str = "en"
+    load_all_available_meta: bool = False
+    doc_content_chars_max: int = 40000
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_environment(cls, values: Dict) -> Any:
+        """Validate that the python package exists in environment."""
+        try:
+            import wikipedia
+
+            lang =  "en"
+            wikipedia.set_lang(lang)
+            values["wiki_client"] = wikipedia
+        except ImportError:
+            raise ImportError(
+                "Could not import wikipedia python package. "
+                "Please install it with `pip install wikipedia`."
+            )
+        return values
+
+
+
+    def run(self, query: str) -> str:
+        """Run Wikipedia search and get page summaries."""
+        page_titles = self.wiki_client.search(
+            query[:WIKIPEDIA_MAX_QUERY_LENGTH], results=self.top_k_results
         )
-        return _first_n_chars(html.unescape(text))
-    except Exception:
-        return ""
-
-def _llm_answer(question: str, context: str, sys_hint: str = "") -> str:
-    client = _openai_client()
-    if not client:
-        return "OPENAI_API_KEY missing."
-    system = (
-        "You are a precise research assistant. Answer the question ONLY from the provided context. "
-        "If the answer is uncertain from the context, say 'unknown'. " + (sys_hint or "")
-    )
-    user = (
-        f"Question:\n{question}\n\n"
-        f"Context:\n{context}\n\n"
-        "Give the final answer only, no citations, no preamble."
-    )
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        temperature=0,
-        messages=[{"role": "system", "content": system},
-                  {"role": "user", "content": user}],
-    )
-    return resp.choices[0].message.content.strip()
+        page_info = []
+        for page_title in page_titles[: self.top_k_results]:
+            if wiki_page := self._fetch_page(page_title):
+                # print(wiki_page)
+                page_info.append(wiki_page.content)
+        return page_info
 
 
-# ----- tools -----
+    @staticmethod
+    def _formatted_page_summary(page_title: str, wiki_page: Any) -> Optional[str]:
+        return f"Page: {page_title}\nSummary: {wiki_page.summary}"
 
-@tool("web_search")
-def web_search_tool(state: State, query: Optional[str] = None, k: int = 5, **kwargs) -> str:
-    """
-    Search the web (DuckDuckGo via ddgs), fetch top pages, and have the LLM answer the current question
-    using ONLY those pages' content.
-    """
-    if not _HAS_DDGS:
-        return "ERROR: web_search requires the 'ddgs' (or legacy 'duckduckgo-search') package."
-    if BeautifulSoup is None:
-        return "ERROR: web_search requires 'beautifulsoup4' installed."
+    def _page_to_document(self, page_title: str, wiki_page: Any) -> Document:
+        main_meta = {
+            "title": page_title,
+            "summary": wiki_page.summary,
+            "source": wiki_page.url,
+        }
+        add_meta = (
+            {
+                "categories": wiki_page.categories,
+                "page_url": wiki_page.url,
+                "image_urls": wiki_page.images,
+                "related_titles": wiki_page.links,
+                "parent_id": wiki_page.parent_id,
+                "references": wiki_page.references,
+                "revision_id": wiki_page.revision_id,
+                "sections": wiki_page.sections,
+            }
+            if self.load_all_available_meta
+            else {}
+        )
+        doc = Document(
+            page_content=wiki_page.content[: self.doc_content_chars_max],
+            metadata={
+                **main_meta,
+                **add_meta,
+            },
+        )
+        return doc
 
-    q = (query or state["question"]).strip()
-    results: List[dict] = []
-    try:
-        with DDGS() as ddg:
-            for r in ddg.text(q, max_results=k):
-                if r and (r.get("href") or r.get("url")):
-                    results.append(r)
-    except Exception as e:
-        return f"ERROR: search failed: {e}"
+    def _fetch_page(self, page: str) -> Optional[str]:
+        try:
+            return self.wiki_client.page(title=page, auto_suggest=False)
+        except (
+            self.wiki_client.exceptions.PageError,
+            self.wiki_client.exceptions.DisambiguationError,
+        ):
+            return None
 
-    if not results:
-        return "ERROR: no search results."
 
-    parts = []
-    for r in results:
-        url = r.get("href") or r.get("url") or ""
-        if not url:
-            continue
-        txt = _fetch_url_text(url)
-        if txt:
-            title = r.get("title") or ""
-            parts.append(f"[{title}] {txt}")
 
-    context = _first_n_chars("\n\n---\n\n".join(parts), 8000)
-    if not context:
-        return "ERROR: could not extract text from results."
+    def load(self, query: str) -> List[Document]:
+        """
+        Run Wikipedia search and get the article text plus the meta information.
+        See
 
-    return _llm_answer(state["question"], context)
+        Returns: a list of documents.
 
+        """
+        return list(self.lazy_load(query))
+
+
+
+
+    def lazy_load(self, query: str) -> Iterator[Document]:
+        """
+        Run Wikipedia search and get the article text plus the meta information.
+        See
+
+        Returns: a list of documents.
+
+        """
+        page_titles = self.wiki_client.search(
+            query[:WIKIPEDIA_MAX_QUERY_LENGTH], results=self.top_k_results
+        )
+        for page_title in page_titles[: self.top_k_results]:
+            if wiki_page := self._fetch_page(page_title):
+                if doc := self._page_to_document(page_title, wiki_page):
+                    yield doc
+
+
+
+# ---- Tools --------------------------------------------------------------------
 
 @tool("wiki_lookup")
 def wiki_lookup_tool(state: State, title_or_query: Optional[str] = None, **kwargs) -> str:
     """
     Pull content from English Wikipedia and answer the current question from it.
-    Tries LlamaIndex WikipediaReader if available; otherwise fetches the /wiki/<Title> page directly.
+    Uses the official REST and action APIs for cleaner plaintext, search + redirects,
+    with an HTML fallback as last resort. Output unchanged.
     """
     q = (title_or_query or state["question"]).strip()
+    wikipedia = WikipediaAPIWrapper()
+    text = wikipedia.run(q)
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    response = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": f"""Question: {q} 
+            "Answer the question in 1-2 word or number only, no explanations or even tags like 'Answer:'."""},
+            {
+                "role": "user",
+                "content": f"Use the following Wikipedia text to answer the question: \n\n{text}\n\n",
+            },
+        ],
+        temperature=0,
+    )
 
-    # Optional: LlamaIndex WikipediaReader
-    try:
-        from llama_index.readers.wikipedia import WikipediaReader  # type: ignore
-        reader = WikipediaReader()
-        # If short query, treat as page title; else try search mode (some versions support 'search')
-        docs = None
-        try:
-            if len(q.split()) <= 6:
-                docs = reader.load_data(pages=[q])
-            else:
-                # some versions support search=..., others only pages=[...]
-                docs = reader.load_data(search=q)  # type: ignore
-        except Exception:
-            # Fallback: try as pages
-            docs = reader.load_data(pages=[q])
-        text = _first_n_chars("\n\n".join(getattr(d, "text", "") for d in docs or []), 8000)
-        if text:
-            return _llm_answer(state["question"], text)
-    except Exception:
-        pass  # fall through to direct fetch
+    return response.choices[0].message.content
 
-    # Direct fetch fallback
-    slug = q.replace(" ", "_")
-    url = f"https://en.wikipedia.org/wiki/{slug}"
-    page_text = _fetch_url_text(url)
-    if page_text:
-        return _llm_answer(state["question"], page_text, sys_hint="If you don't find it here, reply 'unknown'.")
-    return "ERROR: wiki content not found."
+@tool("web_lookup")
+def web_lookup_tool(state: State, title_or_query: Optional[str] = None, **kwargs) -> str:
+    """
+    search the web and answer the current question from it.
+    Uses the Google search api
+    """
+    params = {
+    "engine": "google",
+    "gl": "us",
+    "hl": "en",
+    }
+    search = SerpAPIWrapper(params=params)
+    q = (title_or_query or state["question"]).strip()
+    text = search.run(q)
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    response = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": f"""Question: {q} 
+            "Answer the question in 1-2 word or number only, no explanations or even tags like 'Answer:'."""},
+            {
+                "role": "user",
+                "content": f"Use the following Wikipedia text to answer the question: \n\n{text}\n\n",
+            },
+        ],
+        temperature=0,
+    )
+
+    return response.choices[0].message.content
+

@@ -5,11 +5,28 @@ from ..registry import tool
 from ..state import State
 from ..config import OPENAI_API_KEY, OPENAI_MODEL
 from openai import OpenAI
+from langchain_google_community import SpeechToTextLoader
+from pathlib import Path
 
 
 # =========================
 # OpenAI helpers (robust)
 # =========================
+
+# Try to import youtube-transcript-api
+try:
+    from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, CouldNotRetrieveTranscript
+except Exception:
+    YouTubeTranscriptApi = None
+    TranscriptsDisabled = NoTranscriptFound = CouldNotRetrieveTranscript = Exception  # harmless aliases
+
+
+_YT_ID_PATTERNS = [
+    r"(?:v=)([A-Za-z0-9_\-]{11})",        # https://www.youtube.com/watch?v=VIDEOID
+    r"(?:youtu\.be/)([A-Za-z0-9_\-]{11})",# https://youtu.be/VIDEOID
+    r"(?:embed/)([A-Za-z0-9_\-]{11})",    # https://www.youtube.com/embed/VIDEOID
+]
+
 
 def _openai_client() -> Optional[OpenAI]:
     key = OPENAI_API_KEY or os.getenv("OPENAI_API_KEY", "")
@@ -47,10 +64,10 @@ def _llm_answer(question: str, context: str, sys_hint: str = "") -> str:
 
     system_msg = (
         "You are a precise assistant. Answer ONLY from the given transcript/context. "
+        "Answer with the final answer only. If it is a one word answer that only provide that, no introductions or tags like FINAL ANSWER: necessary"
         "If unknown, reply 'unknown'. " + (sys_hint or "")
     )
-    user_msg = f"Question:\n{question}\n\nTranscript:\n{context}\n\nAnswer with the final answer only."
-
+    user_msg = f"Question:\n{question}\n\nTranscript:\n{context}"   
     # Try Chat Completions first (works for classic chat models).
     try:
         resp = client.chat.completions.create(
@@ -79,6 +96,45 @@ def _llm_answer(question: str, context: str, sys_hint: str = "") -> str:
         return "ERROR: empty model response."
     except Exception as e:
         return f"ERROR: LLM call failed: {e}"
+    
+def _extract_video_id(url_or_id: str) -> Optional[str]:
+    if not url_or_id:
+        return None
+    # If the user already gave an 11-char ID, accept it
+    if re.fullmatch(r"[A-Za-z0-9_\-]{11}", url_or_id):
+        return url_or_id
+    for pat in _YT_ID_PATTERNS:
+        m = re.search(pat, url_or_id)
+        if m:
+            return m.group(1)
+    return None
+    
+def _fetch_yt_transcript_text(
+    video_id: str,
+    lang_prefs: Optional[List[str]] = None,
+    allow_translate_to: Optional[str] = "en",
+) -> str:
+    """
+    Fetches transcript segments and concatenates them into plain text.
+    Resilient to older/newer youtube-transcript-api versions.
+    """
+    if YouTubeTranscriptApi is None:
+        return "ERROR: youtube-transcript-api not installed. Run: pip install youtube-transcript-api"
+
+    ytt_api = YouTubeTranscriptApi()
+    transcript = ytt_api.list(video_id)
+    print(transcript)
+
+    fetched_transcript = ytt_api.fetch(video_id, languages=["en-US"])
+    parts = []
+    for snippet in fetched_transcript:
+        print(snippet.text)
+        parts.append(snippet.text)
+    combined = " ".join(parts).strip() 
+    return combined or "ERROR: fetched empty transcript."
+
+
+
 
 
 # =========================
@@ -91,48 +147,27 @@ def _llm_answer(question: str, context: str, sys_hint: str = "") -> str:
 def asr_tool(state: State, file_path: Optional[str] = None, **kwargs) -> str:
     """
     Transcribe an audio file (mp3/wav/m4a) and answer the current question using the transcript.
-    Uses OpenAI Whisper API (whisper-1 by default). Return format: final answer only (per question’s instruction).
+    Return format: final answer only (per question’s instruction).
     """
-    client = _openai_client()
-    if not client:
-        return "ERROR: OPENAI_API_KEY missing."
+    client = OpenAI()  # needs OPENAI_API_KEY in your env
+    with open(file_path, "rb") as f:
+        # "whisper-1" is the classic; some accounts also have "gpt-4o-transcribe"
+        transcript = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=f
+        )
 
-    path = file_path or state.get("file_name") or state.get("file_path") or ""
-    if not path:
-        return "ERROR: no audio file provided. Pass file_path or set state['file_name']/['file_path']."
-
-    if not os.path.exists(path):
-        return f"ERROR: file not found: {path}"
-
-    # Basic extension hint (not a hard check)
-    if not re.search(r"\.(mp3|wav|m4a|mp4|mpga|mpeg|webm|ogg)$", path, re.IGNORECASE):
-        # Let the API try anyway, but warn the user
-        pass
-
-    # 1) Transcribe
-    try:
-        with open(path, "rb") as f:
-            # If you have access to the newer transcribe model, replace with: model="gpt-4o-transcribe"
-            tr = client.audio.transcriptions.create(model="whisper-1", file=f)
-        transcript = (tr.text or "").strip()
-        if not transcript:
-            return "ERROR: transcription returned empty text."
-    except Exception as e:
-        return f"ERROR: transcription failed: {e}"
-
+    print(transcript.text)
     # 2) Ask LLM to produce the final, formatted answer per the question’s instruction
     question = state.get("question") or kwargs.get("question") or ""
-    if not question:
-        # If no question, just return the transcript to be useful
-        return transcript
 
     system = (
         "You are an extraction assistant. You will be given a question with strict formatting rules, "
-        "and a transcript of an audio clip. Follow the question's instructions EXACTLY and return ONLY the final answer."
+        "and a transcript of an audio clip. Follow the question's instructions EXACTLY and return ONLY the 1-2 word answer, no need of introduction, commentary or even the tags like 'final answer:'"
     )
     user = (
         f"Question (follow formatting strictly):\n{question}\n\n"
-        f"Transcript:\n{transcript}\n\n"
+        f"Transcript:\n{transcript.text}\n\n"
         "Return ONLY the final answer, nothing else."
     )
 
@@ -159,3 +194,46 @@ def asr_tool(state: State, file_path: Optional[str] = None, **kwargs) -> str:
     except Exception as e:
         # fallback: at least return transcript
         return f"ERROR: LLM extraction failed. Transcript: {transcript[:1000]}"
+    
+@tool("yt_transcript")
+def yt_transcript_tool(
+    state: State,
+    url: Optional[str] = None,
+    video_id: Optional[str] = None,
+    question: Optional[str] = None,
+    lang_prefs: Optional[List[str]] = None,
+    **kwargs,
+) -> str:
+    """
+    Pull a YouTube transcript and answer the current question using the LLM.
+    Inputs:
+      - url: a full YouTube URL (watch, youtu.be, or embed)   (optional if video_id given)
+      - video_id: 11-char YouTube ID                          (optional if url given)
+      - question: if omitted, will use state['question'] or return transcript directly
+      - lang_prefs: e.g., ["en","en-US"] -> preferred transcript languages
+    Output:
+      - final answer only (if a question is present), else the raw transcript text.
+    """
+    # Resolve video id
+    vid = _extract_video_id(video_id or url or "")
+    print(f"Extracted video ID: {vid}")
+    if not vid:
+        return "ERROR: Provide a valid YouTube URL or 11-character video_id."
+
+    # Fetch transcript text
+    transcript = _fetch_yt_transcript_text(vid, lang_prefs=lang_prefs or ["en","en-US","en-GB"])
+    print(f"Fetched transcript length: {len(transcript)} chars")
+    print(f"Transcript preview: {transcript[:200]}")
+    if transcript.startswith("ERROR:"):
+        return transcript
+
+    # If there is no question, be useful and return the transcript as-is
+    q = question or state.get("question") or kwargs.get("q") or ""
+    if not q:
+        return transcript
+
+    # Answer using your robust LLM helper (answers 'final answer only')
+    # Add a tiny system hint to keep answers concise and factual
+    sys_hint = "Keep answers concise and quote exact figures if present."
+    return _llm_answer(question=q, context=transcript, sys_hint=sys_hint)
+
